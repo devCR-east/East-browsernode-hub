@@ -39,7 +39,15 @@ log("RAILWAY", `🚀 Starting Railway Hub on port ${PORT}`, { DEBUG_MODE });
 const GUARDIAN_COUNT = 20;
 const BROADCASTER_COUNT = 400; // 20 per guardian
 const VISION_COUNT = 8000; // 20 per broadcaster
+const ECHO_COUNT = 160000; // 20 per vision
 const RELAY_RESCORE_INTERVAL_MS = 60_000;
+
+// Bootstrap: how many peer candidates a freshly-connected node gets handed
+// so it can start its own gossip mesh immediately, instead of waiting up to
+// RELAY_RESCORE_INTERVAL_MS for a tier:assign parent. This is deliberately
+// NOT the same mechanism as tier assignment — no sorting/ranking of the
+// whole roster, just a cheap weighted sample. See sampleBootstrapPeers().
+const BOOTSTRAP_SAMPLE_SIZE = 8;
 
 // Connection ceiling & per-IP rate limit
 const MAX_LIGHT_NODES = Number(process.env.MAX_LIGHT_NODES || 5000);
@@ -87,6 +95,7 @@ interface EastSocket extends WebSocket {
 // ─── State ────────────────────────────────────────────────────────
 let validatorSocket: EastSocket | null = null;
 const lightNodes = new Map<string, EastSocket>();
+const fullLightNodes = new Map<string, EastSocket>(); // subset of lightNodes with nodeType:"full" — see HelloMessage.nodeType doc comment in types.ts
 let latestHeader: BlockHeader | null = null;
 const recentHeaders: BlockHeader[] = []; // rolling buffer, newest last
 const BACKFILL_SIZE = 1000; // How many recent headers sync_request can serve — kept in sync with the ring buffer trim below and with client.ts's RAILWAY_BACKFILL_LIMIT
@@ -102,6 +111,7 @@ interface NodeTelemetry {
   tier: NodeTier;
   parentNodeId: string | null;
   hasFullLedger: boolean;
+  nodeType: "light" | "full";
   messagesReceived: number;
   messagesSent: number;
   lastMessageType?: string;
@@ -115,6 +125,45 @@ interface MessageStats {
   [key: string]: number;
 }
 const messageStats: MessageStats = {};
+
+// ─── RPC balance request/response correlation ──────────────────────
+// Vercel's /internal/rpc-get-balance HTTP call picks a full node and waits
+// on this promise; the matching "rpc_balance_response" WS message (or a
+// timeout) resolves it. Deliberately short-lived and in-memory only — if
+// the hub restarts mid-request, Vercel's own timeout/fallback-to-Postgres
+// handles it, nothing here needs to survive a restart.
+const pendingBalanceRequests = new Map<string, { resolve: (balance: string | null) => void; timeout: NodeJS.Timeout }>();
+const RPC_BALANCE_REQUEST_TIMEOUT_MS = 2000;
+
+function requestBalanceFromFullNode(address: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    // Pick randomly among the top 5 scored full nodes (or however many are
+    // connected, if fewer) — "best PoC score, chosen randomly among the
+    // good candidates" per the design brief, so load doesn't always funnel
+    // through a single top-ranked node.
+    const candidates = [...fullLightNodes.entries()]
+      .map(([nodeId, socket]) => ({ nodeId, socket, score: score(telemetry.get(nodeId)!) }))
+      .filter((c) => telemetry.get(c.nodeId)) // telemetry must exist
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
+
+    if (candidates.length === 0) {
+      resolve(null); // no full node available — caller falls back to Postgres
+      return;
+    }
+    const picked = candidates[Math.floor(Math.random() * candidates.length)];
+
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const timeout = setTimeout(() => {
+      pendingBalanceRequests.delete(requestId);
+      resolve(null); // timed out — caller falls back to Postgres
+    }, RPC_BALANCE_REQUEST_TIMEOUT_MS);
+    pendingBalanceRequests.set(requestId, { resolve, timeout });
+
+    send(picked.socket, { type: "rpc_balance_request", requestId, address });
+    logDebug("RPC", `Balance request ${requestId} sent to ${picked.nodeId}`, { address, candidateCount: candidates.length });
+  });
+}
 
 function recordMessageStat(type: string) {
   messageStats[type] = (messageStats[type] || 0) + 1;
@@ -141,6 +190,31 @@ function score(t: NodeTelemetry): number {
   return latencyScore * Math.log1p(t.participationSeconds) * Math.log1p(t.verifiedHeaderCount);
 }
 
+// Weighted random sample of up to `count` connected light nodes, excluding
+// `excludeNodeId` (the requester itself). Weighted by participationSeconds
+// (+1 so a brand-new node still has a nonzero, just small, chance) using the
+// Efraimidis-Spirakis algorithm: each candidate gets key = random()^(1/weight),
+// and the top `count` keys win. This is deliberately NOT pure-random —
+// pure-random sampling over all connected sockets would let an attacker who
+// opens thousands of throwaway connections dominate the sample a new node
+// receives (a classic eclipse-attack setup), since every socket counts
+// equally regardless of how long it's actually been a real, active node.
+// Biasing toward proven participationSeconds means a Sybil swarm of
+// just-connected sockets rarely gets drawn compared to nodes with an actual
+// track record. This never touches score() or recomputeTiers() — it's O(N)
+// once per bootstrap (rare), not O(N) on a recurring timer.
+function sampleBootstrapPeers(excludeNodeId: string, count: number): string[] {
+  const keyed: { nodeId: string; key: number }[] = [];
+  for (const [nodeId, socket] of lightNodes) {
+    if (nodeId === excludeNodeId) continue;
+    if (socket.readyState !== socket.OPEN) continue;
+    const weight = (telemetry.get(nodeId)?.participationSeconds ?? 0) + 1;
+    keyed.push({ nodeId, key: Math.random() ** (1 / weight) });
+  }
+  keyed.sort((a, b) => b.key - a.key);
+  return keyed.slice(0, count).map((c) => c.nodeId);
+}
+
 function recomputeTiers() {
   const validNodes = [...telemetry.entries()].filter(([, t]) => t.avgLatencyMs > 0);
   logDebug("TIERS", `Computing tiers from ${validNodes.length} valid nodes`, { totalNodes: telemetry.size });
@@ -155,6 +229,10 @@ function recomputeTiers() {
   const visionIds = ranked.slice(
     1 + GUARDIAN_COUNT + BROADCASTER_COUNT,
     1 + GUARDIAN_COUNT + BROADCASTER_COUNT + VISION_COUNT
+  );
+  const echoIds = ranked.slice(
+    1 + GUARDIAN_COUNT + BROADCASTER_COUNT + VISION_COUNT,
+    1 + GUARDIAN_COUNT + BROADCASTER_COUNT + VISION_COUNT + ECHO_COUNT
   );
 
   // Build the new (tier, parent) for every node currently known, whether
@@ -174,6 +252,12 @@ function recomputeTiers() {
     const parent = broadcasterIds.length > 0 ? broadcasterIds[i % broadcasterIds.length]
       : (guardianIds.length > 0 ? guardianIds[i % guardianIds.length] : leaderId);
     assignments.set(id, { tier: "vision", parentNodeId: parent });
+  });
+  echoIds.forEach((id, i) => {
+    const parent = visionIds.length > 0 ? visionIds[i % visionIds.length]
+      : (broadcasterIds.length > 0 ? broadcasterIds[i % broadcasterIds.length]
+        : (guardianIds.length > 0 ? guardianIds[i % guardianIds.length] : leaderId));
+    assignments.set(id, { tier: "echo", parentNodeId: parent });
   });
 
   let changedCount = 0;
@@ -197,7 +281,8 @@ function recomputeTiers() {
     guardians: guardianIds.length,
     broadcasters: broadcasterIds.length,
     visions: visionIds.length,
-    unranked: telemetry.size - (leaderId ? 1 : 0) - guardianIds.length - broadcasterIds.length - visionIds.length,
+    echoes: echoIds.length,
+    unranked: telemetry.size - (leaderId ? 1 : 0) - guardianIds.length - broadcasterIds.length - visionIds.length - echoIds.length,
     reassigned: changedCount,
   });
 }
@@ -214,6 +299,22 @@ function send(socket: EastSocket, msg: unknown) {
   } else {
     logDebug("SOCKET", `Cannot send - socket not open for ${socket.nodeId}`, { state: socket.readyState });
   }
+}
+
+function broadcastToFullNodes(msg: unknown) {
+  const json = JSON.stringify(msg);
+  let sentCount = 0;
+  fullLightNodes.forEach((socket) => {
+    if (socket.readyState === WebSocket.OPEN) {
+      try {
+        socket.send(json);
+        sentCount++;
+      } catch (err) {
+        log("BROADCAST", `❌ Error broadcasting balance update to ${socket.nodeId}`, err);
+      }
+    }
+  });
+  logDebug("BROADCAST", `Balance update broadcast complete`, { sentTo: sentCount, totalFullNodes: fullLightNodes.size });
 }
 
 function broadcastToLightNodes(msg: unknown) {
@@ -280,6 +381,7 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
         guardian: [...telemetry.values()].filter((t) => t.tier === "guardian").length,
         broadcaster: [...telemetry.values()].filter((t) => t.tier === "broadcaster").length,
         vision: [...telemetry.values()].filter((t) => t.tier === "vision").length,
+        echo: [...telemetry.values()].filter((t) => t.tier === "echo").length,
         none: [...telemetry.values()].filter((t) => t.tier === "none").length,
       },
       fullSyncProviders: currentFullSyncProviders,
@@ -367,6 +469,75 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
     return;
   }
 
+  // ─── HTTP: Vercel pushes a balance change to broadcast to full nodes ──
+  if (req.method === "POST" && req.url === "/internal/push-balance-update") {
+    const authHeader = req.headers["x-railway-secret"];
+    if (!VALIDATOR_SECRET || authHeader !== VALIDATOR_SECRET) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: false, error: "UNAUTHORIZED" }));
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 64 * 1024) {
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: "PAYLOAD_TOO_LARGE" }));
+      }
+    });
+    req.on("end", () => {
+      try {
+        const { address, balance } = JSON.parse(body) as { address: string; balance: string };
+        if (!address || typeof balance !== "string") {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: "INVALID_PAYLOAD" }));
+          return;
+        }
+        broadcastToFullNodes({ type: "balance:update", address, balance });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true, relayedTo: fullLightNodes.size }));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: "INVALID_JSON" }));
+      }
+    });
+    return;
+  }
+
+  // ─── HTTP: Vercel's /api/rpc asks a full node to answer eth_getBalance ──
+  // Always resolves (never 5xx on "no full node available" — that's a
+  // normal, expected state, not a hub error) so the caller's own timeout
+  // logic doesn't need special-casing: { balance: null } means "fall back
+  // to Postgres", same as a timeout would.
+  if (req.method === "POST" && req.url === "/internal/rpc-get-balance") {
+    const authHeader = req.headers["x-railway-secret"];
+    if (!VALIDATOR_SECRET || authHeader !== VALIDATOR_SECRET) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: false, error: "UNAUTHORIZED" }));
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", async () => {
+      try {
+        const { address } = JSON.parse(body) as { address: string };
+        if (!address) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: "INVALID_PAYLOAD" }));
+          return;
+        }
+        const balance = await requestBalanceFromFullNode(address);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true, balance, source: balance !== null ? "full_node" : "none_available" }));
+      } catch (err) {
+        log("RPC", "❌ rpc-get-balance error", err);
+        res.writeHead(200, { "Content-Type": "application/json" }); // still 200 — caller falls back either way
+        res.end(JSON.stringify({ success: true, balance: null, source: "error" }));
+      }
+    });
+    return;
+  }
+
   log("HTTP", `⚠️  Unhandled HTTP request`, { method: req.method, url: req.url });
   res.writeHead(404);
   res.end();
@@ -450,6 +621,7 @@ wss.on("connection", (socket: EastSocket, req) => {
           socket.role = "light-node";
           socket.nodeId = msg.nodeId;
           lightNodes.set(msg.nodeId, socket);
+          const nodeType: "light" | "full" = msg.nodeType === "full" ? "full" : "light";
           telemetry.set(msg.nodeId, {
             lastHeartbeat: Date.now(),
             lastAckHeight: -1,
@@ -460,10 +632,12 @@ wss.on("connection", (socket: EastSocket, req) => {
             tier: "none",
             parentNodeId: null,
             hasFullLedger: false,
+            nodeType,
             messagesReceived: 1,
             messagesSent: 0,
             lastMessageType: "hello",
           });
+          if (nodeType === "full") fullLightNodes.set(msg.nodeId, socket);
 
           log("NODE", `✅ Light node connected`, {
             nodeId: msg.nodeId,
@@ -478,6 +652,17 @@ wss.on("connection", (socket: EastSocket, req) => {
           // parent on the next periodic rescore, same as it always waited
           // for the old roster to consider it.
           send(socket, { type: "full_sync_providers", nodeIds: currentFullSyncProviders });
+
+          // Bootstrap sample goes out immediately (not gated on the 60s
+          // rescore) so the node can start dialing peers and running its own
+          // gossip mesh (PEX + mesh expansion, see webrtc-peer.ts/client.ts)
+          // right away instead of sitting with zero peers until tier:assign
+          // eventually arrives. tier:assign still comes later and still
+          // governs scoring/leader duties — this is purely about not
+          // leaving a brand-new node isolated in the meantime.
+          const bootstrapPeers = sampleBootstrapPeers(msg.nodeId, BOOTSTRAP_SAMPLE_SIZE);
+          send(socket, { type: "bootstrap_peers", nodeIds: bootstrapPeers });
+          log("BOOTSTRAP", `🌱 Bootstrap sample sent on connect`, { nodeId: msg.nodeId, sampleSize: bootstrapPeers.length });
 
           const nodeTelemetry = telemetry.get(msg.nodeId);
           if (nodeTelemetry) {
@@ -624,6 +809,18 @@ wss.on("connection", (socket: EastSocket, req) => {
       }
 
       // ── Relay scoring: node self-reports, Railway just stores it ────
+      // Explicit re-ask — used when a node's peer mesh has fully collapsed
+      // (connectedPeerIds hits 0) and it needs a fresh sample to restart
+      // its own gossip growth. Same sampling as the one sent on hello;
+      // this is just the "ask again later" path, so it stays just as cheap.
+      case "bootstrap_request": {
+        if (socket.role !== "light-node" || !socket.nodeId) return;
+        const peers = sampleBootstrapPeers(socket.nodeId, BOOTSTRAP_SAMPLE_SIZE);
+        send(socket, { type: "bootstrap_peers", nodeIds: peers });
+        log("BOOTSTRAP", `🌱 Bootstrap sample sent on request`, { nodeId: socket.nodeId, sampleSize: peers.length });
+        break;
+      }
+
       case "relay_stats": {
         if (socket.role !== "light-node" || !socket.nodeId) return;
         const nodeTelemetry = telemetry.get(socket.nodeId);
@@ -647,6 +844,20 @@ wss.on("connection", (socket: EastSocket, req) => {
             recomputeFullSyncProviders();
           }
         }
+        break;
+      }
+
+      // A "full" node answering a balance query we (Railway) asked it via
+      // requestBalanceFromFullNode() above. Anything unmatched (unknown/
+      // expired requestId) is silently dropped — the HTTP caller already
+      // timed out and fell back to Postgres by the time a very late reply
+      // shows up, so there's nothing to resolve.
+      case "rpc_balance_response": {
+        const pending = pendingBalanceRequests.get(msg.requestId);
+        if (!pending) break;
+        clearTimeout(pending.timeout);
+        pendingBalanceRequests.delete(msg.requestId);
+        pending.resolve(msg.balance);
         break;
       }
 
@@ -737,6 +948,7 @@ wss.on("connection", (socket: EastSocket, req) => {
       log("CONNECTION", `❌ Validator disconnected`, { nodeId: socket.nodeId, connectedForSeconds: duration });
     } else if (socket.nodeId) {
       lightNodes.delete(socket.nodeId);
+      fullLightNodes.delete(socket.nodeId);
       telemetry.delete(socket.nodeId);
 
       log("CONNECTION", `❌ Light node disconnected`, {
@@ -749,11 +961,11 @@ wss.on("connection", (socket: EastSocket, req) => {
         lastAckHeight: t?.lastAckHeight ?? -1,
       });
 
-      // If this node had descendants relying on it (anything but a Vision
+      // If this node had descendants relying on it (anything but an Echo
       // leaf, which nothing else's parent points to), don't make them wait
       // out the full rescore interval disconnected from the tree — recompute
-      // right away. A Vision leaving just quietly drops out of the count.
-      if (t && (t.tier === "leader" || t.tier === "guardian" || t.tier === "broadcaster")) {
+      // right away. An Echo leaving just quietly drops out of the count.
+      if (t && (t.tier === "leader" || t.tier === "guardian" || t.tier === "broadcaster" || t.tier === "vision")) {
         log("TIERS", `🔄 Recomputing tiers early — a ${t.tier} disconnected`, { nodeId: socket.nodeId });
         recomputeTiers();
       }
@@ -812,6 +1024,7 @@ setInterval(() => {
     guardianCount: [...telemetry.values()].filter((t) => t.tier === "guardian").length,
     broadcasterCount: [...telemetry.values()].filter((t) => t.tier === "broadcaster").length,
     visionCount: [...telemetry.values()].filter((t) => t.tier === "vision").length,
+    echoCount: [...telemetry.values()].filter((t) => t.tier === "echo").length,
     fullSyncProvidersCount: currentFullSyncProviders.length,
     memoryUsage: process.memoryUsage(),
     messageStats,

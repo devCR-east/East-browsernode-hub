@@ -32,6 +32,18 @@ export interface HelloMessage {
   nodeId: string;
   secret?: string; // required when role === "validator"
   chainId?: number; // light nodes should send EAST_CHAIN_ID; missing = pre-upgrade client, allowed through with a warning rather than dropped
+  // Opt-in only — a light node declares itself "full" by choice (storage/
+  // battery cost of maintaining a balance replica). Separate concept from
+  // hasFullLedger (RelayStatsMessage below): hasFullLedger is about serving
+  // full BLOCK HISTORY for catch-up sync and is validator-daemon-only;
+  // nodeType:"full" is about serving BALANCE queries for the MetaMask-facing
+  // RPC endpoint and is something any light node (browser or daemon) can
+  // opt into. A malicious/wrong answer from a "full" node is caught the
+  // same way everything else here is: the requester (Vercel's /api/rpc)
+  // falls back to querying Postgres directly if the full-node's answer
+  // looks wrong or doesn't arrive in time — a full-node is a read-latency
+  // optimization, never a trusted-without-checking source of truth.
+  nodeType?: "light" | "full";
 }
 
 export interface WelcomeMessage {
@@ -85,21 +97,23 @@ export interface TxSubmitMessage {
 // meant only ~100 total lightnodes could ever hold a P2P slot — everyone
 // past that fell back to hitting Vercel/the validator/the archive
 // directly, defeating the point). Instead, ALL scored nodes are ranked by
-// the same score() function and sliced into 4 tiers, each node getting
+// the same score() function and sliced into 5 tiers, each node getting
 // exactly ONE parent to dial (not a menu of candidates):
-//   Leader (rank 0, 1 node)       — parent: null, talks to Railway directly
-//   Guardian (rank 1-20, 20)      — parent: the Leader
-//   Broadcaster (rank 21-420, 400)— parent: one of the 20 Guardians
-//   Vision (rank 421-8420, 8000)  — parent: one of the 400 Broadcasters
-//   none (rank 8421+, or not yet scored) — parent: null, falls back to
+//   Leader (rank 0, 1 node)              — parent: null, talks to Railway directly
+//   Guardian (rank 1-20, 20)             — parent: the Leader
+//   Broadcaster (rank 21-420, 400)       — parent: one of the 20 Guardians
+//   Vision (rank 421-8420, 8000)         — parent: one of the 400 Broadcasters
+//   Echo (rank 8421-168420, 160000)      — parent: one of the 8000 Visions
+//   none (rank 168421+, or not yet scored) — parent: null, falls back to
 //     Railway/archive/validator directly same as today, until scored in
 //     on a future rescore
 // A new block flows Leader → its 20 Guardians → their 400 Broadcasters →
-// their 8000 Visions, 3 WebRTC hops covering up to ~8421 nodes instead of
-// however many thousand all hitting Railway/Vercel independently. Railway
-// holds the whole tree structure in memory (see telemetry map) since it
-// computed it — nodes don't need to track their own subtree.
-export type NodeTier = "leader" | "guardian" | "broadcaster" | "vision" | "none";
+// their 8000 Visions → their 160000 Echoes, 4 WebRTC hops covering up to
+// ~168421 nodes instead of however many thousand all hitting
+// Railway/Vercel independently. Railway holds the whole tree structure in
+// memory (see telemetry map) since it computed it — nodes don't need to
+// track their own subtree.
+export type NodeTier = "leader" | "guardian" | "broadcaster" | "vision" | "echo" | "none";
 
 // Sent 1:1 whenever a node's tier or parent changes (including on first
 // assignment). parentNodeId is null only for "leader" and "none" — both
@@ -184,9 +198,58 @@ export interface IceCandidateMessage {
   candidate: string;
 }
 
+// ── Bootstrap discovery ─────────────────────────────────────────────
+// Gives a freshly-connected node a handful of peer candidates immediately,
+// instead of it sitting with zero peers until the next RELAY_RESCORE_INTERVAL_MS
+// tier:assign cycle. Deliberately separate from tier assignment: no ranking
+// of the whole roster, just a cheap weighted sample (see
+// sampleBootstrapPeers() in server.ts) biased toward nodes with a proven
+// participation history, so a swarm of throwaway connections can't dominate
+// the sample a new node receives. Railway sends BootstrapPeersMessage
+// unprompted right after "hello"; BootstrapRequestMessage is the explicit
+// re-ask a node sends if its whole peer mesh has since collapsed to zero.
+export interface BootstrapRequestMessage {
+  type: "bootstrap_request";
+}
+export interface BootstrapPeersMessage {
+  type: "bootstrap_peers";
+  nodeIds: string[];
+}
+
 export interface PingMessage { type: "ping"; }
 export interface PongMessage { type: "pong"; time: number; }
 export interface ErrorMessage { type: "error"; message: string; }
+
+// ── Full Lightnode balance replica (RPC read-path optimization) ────────
+// BalanceUpdateMessage: Vercel pushes this to Railway via the authenticated
+// /internal/push-balance-update HTTP route (same x-railway-secret pattern
+// as /internal/publish-block) whenever a balance actually changes on-chain.
+// Railway broadcasts it to every connected nodeType:"full" node so their
+// local replicas stay current — Railway itself does NOT persist this
+// beyond the in-memory broadcast, same "blind relay" role as everywhere
+// else in this file.
+export interface BalanceUpdateMessage {
+  type: "balance:update";
+  address: string;
+  balance: string; // decimal string, not a JS number — avoids float precision loss for large EAST amounts
+}
+
+// RpcBalanceRequestMessage: Railway → one specific full node, when Vercel's
+// /api/rpc asks Railway to resolve an eth_getBalance read via a full node
+// instead of Postgres directly. requestId round-trips so Railway can match
+// the reply without ambiguity if multiple requests are in flight.
+export interface RpcBalanceRequestMessage {
+  type: "rpc_balance_request";
+  requestId: string;
+  address: string;
+}
+export interface RpcBalanceResponseMessage {
+  type: "rpc_balance_response";
+  requestId: string;
+  address: string;
+  balance: string | null; // null = "I don't have this address in my replica"
+}
+
 
 export type InboundMessage =
   | HelloMessage
@@ -201,5 +264,7 @@ export type InboundMessage =
   | WebrtcOfferMessage
   | WebrtcAnswerMessage
   | IceCandidateMessage
+  | BootstrapRequestMessage
+  | RpcBalanceResponseMessage
   | PingMessage;
 
