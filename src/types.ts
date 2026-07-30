@@ -250,6 +250,24 @@ export interface RpcBalanceResponseMessage {
   balance: string | null; // null = "I don't have this address in my replica"
 }
 
+// ── Full node reset-detection: signed sync attestations ────────────────
+// Broadcast to every connected full node so a suspicious height regression
+// can be caught by ANY peer holding two attestations from the same
+// wallet_address, not just by the wallet app's own Postgres bookkeeping.
+// Railway relays this — same "blind relay, never the trust anchor" role as
+// everywhere else in this file. Signature verification happens at the
+// wallet app (before this ever reaches Railway) and, in principle, can
+// also be redone by any peer that receives it (ethers.verifyMessage needs
+// only the payload + signature, no secret).
+export interface SyncAttestationMessage {
+  type: "sync:attestation";
+  walletAddress: string;
+  nodeId: string;
+  height: number;
+  signedAt: number;
+  signature: string;
+}
+
 
 export type InboundMessage =
   | HelloMessage

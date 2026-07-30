@@ -504,6 +504,48 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
     return;
   }
 
+  // ─── HTTP: wallet app pushes a VERIFIED signed sync attestation to
+  // relay to every connected full node — see types.ts's SyncAttestationMessage
+  // doc comment. Railway does not verify the signature itself (it isn't
+  // in the trust path either way — the wallet app already verified it
+  // before calling this, and any peer receiving the broadcast can redo
+  // that verification independently); it only relays.
+  if (req.method === "POST" && req.url === "/internal/push-sync-attestation") {
+    const authHeader = req.headers["x-railway-secret"];
+    if (!VALIDATOR_SECRET || authHeader !== VALIDATOR_SECRET) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: false, error: "UNAUTHORIZED" }));
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 64 * 1024) {
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: "PAYLOAD_TOO_LARGE" }));
+      }
+    });
+    req.on("end", () => {
+      try {
+        const { walletAddress, nodeId, height, signedAt, signature } = JSON.parse(body) as {
+          walletAddress: string; nodeId: string; height: number; signedAt: number; signature: string;
+        };
+        if (!walletAddress || !nodeId || typeof height !== "number" || typeof signedAt !== "number" || !signature) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: "INVALID_PAYLOAD" }));
+          return;
+        }
+        broadcastToFullNodes({ type: "sync:attestation", walletAddress, nodeId, height, signedAt, signature });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true, relayedTo: fullLightNodes.size }));
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: false, error: "INVALID_JSON" }));
+      }
+    });
+    return;
+  }
+
   // ─── HTTP: Vercel's /api/rpc asks a full node to answer eth_getBalance ──
   // Always resolves (never 5xx on "no full node available" — that's a
   // normal, expected state, not a hub error) so the caller's own timeout
