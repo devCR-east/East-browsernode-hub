@@ -3,6 +3,13 @@ import { WebSocketServer, WebSocket } from "ws";
 import {
   InboundMessage, BlockHeader, Role, EAST_CHAIN_ID, NodeTier,
 } from "./types";
+import {
+  chainConfigured,
+  chainBaseUrl,
+  proxyGet,
+  proxyPostTx,
+  pingValidator,
+} from "./chain-proxy";
 
 const PORT = Number(process.env.PORT || process.env.WS_PORT || 8081);
 const VALIDATOR_SECRET = process.env.RAILWAY_VALIDATOR_SECRET || "";
@@ -464,8 +471,30 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
   }
 
   if (req.method === "GET" && req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, uptime: process.uptime() }));
+    // Async health includes optional chain (east-validator) reachability.
+    (async () => {
+      const chain = chainConfigured()
+        ? await pingValidator()
+        : { ok: false, error: "EAST_VALIDATOR_URL not set" };
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        ok: true,
+        uptime: process.uptime(),
+        hub: {
+          lightNodesConnected: lightNodes.size,
+          latestHeaderHeight: latestHeader?.height ?? -1,
+          validatorWsConnected: !!validatorSocket,
+        },
+        chain: {
+          configured: chainConfigured(),
+          url: chainConfigured() ? chainBaseUrl() : null,
+          ...chain,
+        },
+      }));
+    })().catch((err) => {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: String(err) }));
+    });
     return;
   }
 
@@ -579,6 +608,92 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
     });
     return;
   }
+
+
+  // ─── Phase 2: public RPC proxy → east-validator (chain source of truth) ─
+  {
+    const urlPath = (req.url || "").split("?")[0];
+
+    if (req.method === "GET" && urlPath === "/rpc/block/latest") {
+      void (async () => {
+        const result = await proxyGet("/block/latest");
+        res.writeHead(result.status, { "Content-Type": result.contentType });
+        res.end(result.body);
+      })();
+      return;
+    }
+
+    const blockMatch = urlPath.match(/^\/rpc\/block\/(\d+)$/);
+    if (req.method === "GET" && blockMatch) {
+      const height = blockMatch[1];
+      void (async () => {
+        const result = await proxyGet(`/block/${height}`);
+        res.writeHead(result.status, { "Content-Type": result.contentType });
+        res.end(result.body);
+      })();
+      return;
+    }
+
+    const accountMatch = urlPath.match(/^\/rpc\/account\/([^/]+)$/);
+    if (req.method === "GET" && accountMatch) {
+      const address = decodeURIComponent(accountMatch[1]);
+      void (async () => {
+        const result = await proxyGet(`/account/${encodeURIComponent(address)}`);
+        res.writeHead(result.status, { "Content-Type": result.contentType });
+        res.end(result.body);
+      })();
+      return;
+    }
+
+    if (req.method === "GET" && urlPath === "/rpc/supply") {
+      void (async () => {
+        const result = await proxyGet("/supply");
+        res.writeHead(result.status, { "Content-Type": result.contentType });
+        res.end(result.body);
+      })();
+      return;
+    }
+
+    const bucketMatch = urlPath.match(/^\/rpc\/supply\/([^/]+)$/);
+    if (req.method === "GET" && bucketMatch) {
+      const bucket = decodeURIComponent(bucketMatch[1]);
+      void (async () => {
+        const result = await proxyGet(`/supply/${encodeURIComponent(bucket)}`);
+        res.writeHead(result.status, { "Content-Type": result.contentType });
+        res.end(result.body);
+      })();
+      return;
+    }
+
+    if (req.method === "GET" && urlPath === "/rpc/stats") {
+      void (async () => {
+        const result = await proxyGet("/stats");
+        res.writeHead(result.status, { "Content-Type": result.contentType });
+        res.end(result.body);
+      })();
+      return;
+    }
+
+    if (req.method === "POST" && urlPath === "/rpc/tx") {
+      let body = "";
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", () => {
+        void (async () => {
+          if (!body || body.length > 1_000_000) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "invalid_or_too_large_body" }));
+            return;
+          }
+          log("RPC", "➡️  proxy POST /tx → east-validator", { bytes: body.length });
+          const result = await proxyPostTx(body);
+          res.writeHead(result.status, { "Content-Type": result.contentType });
+          res.end(result.body);
+        })();
+      });
+      return;
+    }
+  }
+
 
   log("HTTP", `⚠️  Unhandled HTTP request`, { method: req.method, url: req.url });
   res.writeHead(404);
@@ -1082,7 +1197,12 @@ httpServer.listen(PORT, () => {
       `http://localhost:${PORT}/status (Status)`,
       `http://localhost:${PORT}/health (Health Check)`,
       `http://localhost:${PORT}/internal/publish-block (Block Publish)`,
+      `http://localhost:${PORT}/rpc/* (Phase 2 chain proxy → EAST_VALIDATOR_URL)`,
     ],
+    chainProxy: {
+      configured: chainConfigured(),
+      url: chainConfigured() ? chainBaseUrl() : null,
+    },
   });
 });
 

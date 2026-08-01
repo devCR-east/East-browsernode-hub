@@ -1,8 +1,8 @@
 {
   "name": "east-railway-hub",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "private": true,
-  "description": "EAST Railway Hub — relay only, not part of consensus. Relays blocks from the L1 validator (Vercel) to connected Light Nodes, and forwards heartbeat/sync/ack/tx messages back.",
+  "description": "EAST Railway Hub \u2014 WS relay + Phase-2 HTTP gateway to east-validator. Not part of consensus; proxies /rpc/* to the chain sealer.",
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
