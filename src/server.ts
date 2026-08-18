@@ -105,7 +105,104 @@ const lightNodes = new Map<string, EastSocket>();
 const fullLightNodes = new Map<string, EastSocket>(); // subset of lightNodes with nodeType:"full" — see HelloMessage.nodeType doc comment in types.ts
 let latestHeader: BlockHeader | null = null;
 const recentHeaders: BlockHeader[] = []; // rolling buffer, newest last
+
 const BACKFILL_SIZE = 1000; // How many recent headers sync_request can serve — kept in sync with the ring buffer trim below and with client.ts's RAILWAY_BACKFILL_LIMIT
+
+/** Max headers to fetch from validator in one catch-up (closes -1/-2 gaps fast). */
+const CATCHUP_MAX_FETCH = 32;
+
+function headerFromValidatorJson(j: any): BlockHeader | null {
+  const height = Number(j?.height);
+  const hash = String(j?.hash || "");
+  if (!Number.isFinite(height) || height <= 0 || !hash) return null;
+  return {
+    height,
+    hash,
+    previousHash: String(j.prev_hash || j.previousHash || j.prevHash || ""),
+    merkleRoot: String(j.state_root || j.merkleRoot || j.merkle_root || ""),
+    validator: (j.proposer || j.validator || null) as string | null,
+    timestamp: Number(j.timestamp) || Date.now(),
+    epoch: Number(j.epoch) || 0,
+    signature: (j.signature || null) as string | null,
+  };
+}
+
+function rememberHeader(hdr: BlockHeader) {
+  if (!recentHeaders.some((h) => h.height === hdr.height)) {
+    recentHeaders.push(hdr);
+    if (recentHeaders.length > BACKFILL_SIZE) recentHeaders.shift();
+  }
+  if (!latestHeader || hdr.height >= latestHeader.height) {
+    latestHeader = hdr;
+  }
+}
+
+/** Build ordered headers from (fromHeight+1)..tip, filling gaps via validator HTTP. */
+async function buildCatchUpHeaders(fromHeight: number): Promise<BlockHeader[]> {
+  let tip = latestHeader?.height ?? -1;
+
+  // Refresh tip from sealer so hub is not stuck 1–2 blocks behind
+  if (chainConfigured()) {
+    try {
+      const latestRes = await proxyGet("/block/latest");
+      if (latestRes.status === 200) {
+        const j = JSON.parse(latestRes.body);
+        const tipHdr = headerFromValidatorJson(j);
+        if (tipHdr) {
+          rememberHeader(tipHdr);
+          tip = tipHdr.height;
+        }
+      }
+    } catch (e) {
+      log("SYNC", "⚠️  tip refresh from validator failed", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  if (tip < 0) {
+    return recentHeaders.slice(-BACKFILL_SIZE);
+  }
+
+  const start =
+    Number.isFinite(fromHeight) && fromHeight >= 0
+      ? Math.floor(fromHeight) + 1
+      : Math.max(1, tip - CATCHUP_MAX_FETCH + 1);
+
+  if (start > tip) {
+    // Client already at or past tip — still send tip header once for confirm
+    const tipHdr = recentHeaders.find((h) => h.height === tip) || latestHeader;
+    return tipHdr ? [tipHdr] : [];
+  }
+
+  const byHeight = new Map<number, BlockHeader>();
+  for (const h of recentHeaders) byHeight.set(h.height, h);
+
+  const out: BlockHeader[] = [];
+  const end = Math.min(tip, start + CATCHUP_MAX_FETCH - 1);
+
+  for (let height = start; height <= end; height++) {
+    let hdr = byHeight.get(height);
+    if (!hdr && chainConfigured()) {
+      try {
+        const res = await proxyGet(`/block/${height}`);
+        if (res.status === 200) {
+          hdr = headerFromValidatorJson(JSON.parse(res.body)) || undefined;
+          if (hdr) {
+            rememberHeader(hdr);
+            byHeight.set(height, hdr);
+          }
+        }
+      } catch {
+        /* skip this height */
+      }
+    }
+    if (hdr) out.push(hdr);
+  }
+
+  return out;
+}
+
 
 // Node telemetry for /status endpoint
 interface NodeTelemetry {
@@ -894,36 +991,52 @@ wss.on("connection", (socket: EastSocket, req) => {
           return;
         }
 
-        const backfill = recentHeaders.slice(-BACKFILL_SIZE);
-        log("SYNC", `🔄 Sync request received`, {
-          nodeId: socket.nodeId,
-          requestFromHeight: msg.fromHeight,
-          backfillSize: backfill.length,
-          maxBackfillSize: BACKFILL_SIZE,
-          availableBlockRange: recentHeaders.length > 0
-            ? `${recentHeaders[0]?.height} - ${recentHeaders[recentHeaders.length - 1]?.height}`
-            : "empty",
-          latestHeight: latestHeader?.height ?? -1,
-        });
+        const fromH = Number((msg as { fromHeight?: number }).fromHeight ?? -1);
+        const nodeId = socket.nodeId;
 
-        if (backfill.length > 0) {
-          send(socket, { type: "block:backfill", headers: backfill });
-          const nodeTelemetry = telemetry.get(socket.nodeId);
-          if (nodeTelemetry) nodeTelemetry.messagesSent++;
-          log("SYNC", `📦 Backfill sent`, {
-            nodeId: socket.nodeId,
-            blocksCount: backfill.length,
-            heightRange: `${backfill[0]?.height} - ${backfill[backfill.length - 1]?.height}`,
-          });
-        } else {
-          log("SYNC", `⚠️  No backfill available`, { nodeId: socket.nodeId, recentHeadersCount: recentHeaders.length });
-        }
+        // Async catch-up: filter by fromHeight and fill gaps from validator so
+        // clients are not stuck at tip-1 / tip-2 when RAM ring is incomplete.
+        void (async () => {
+          try {
+            const backfill = await buildCatchUpHeaders(fromH);
+            log("SYNC", `🔄 Sync request (catch-up)`, {
+              nodeId,
+              requestFromHeight: fromH,
+              backfillSize: backfill.length,
+              latestHeight: latestHeader?.height ?? -1,
+              heightRange:
+                backfill.length > 0
+                  ? `${backfill[0]?.height} - ${backfill[backfill.length - 1]?.height}`
+                  : "empty",
+            });
+
+            if (backfill.length > 0) {
+              send(socket, { type: "block:backfill", headers: backfill });
+              const nodeTelemetry = telemetry.get(nodeId);
+              if (nodeTelemetry) nodeTelemetry.messagesSent++;
+              log("SYNC", `📦 Catch-up backfill sent`, {
+                nodeId,
+                blocksCount: backfill.length,
+                heightRange: `${backfill[0]?.height} - ${backfill[backfill.length - 1]?.height}`,
+              });
+            } else {
+              log("SYNC", `⚠️  No catch-up headers`, {
+                nodeId,
+                fromHeight: fromH,
+                tip: latestHeader?.height ?? -1,
+              });
+            }
+          } catch (e) {
+            log("SYNC", `❌ Catch-up failed`, {
+              nodeId,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
+        })();
 
         if (validatorSocket) {
           send(validatorSocket, msg);
-          log("SYNC", `📤 Sync request forwarded to validator`, { nodeId: socket.nodeId, fromHeight: msg.fromHeight });
-        } else {
-          log("SYNC", `⚠️  Sync request not forwarded - validator offline`, { nodeId: socket.nodeId });
+          log("SYNC", `📤 Sync request forwarded to validator`, { nodeId, fromHeight: fromH });
         }
         break;
       }
